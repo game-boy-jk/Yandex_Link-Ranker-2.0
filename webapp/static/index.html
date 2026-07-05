@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Link finder</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <aside class="history-panel" id="historyPanel" aria-label="История запросов">
+    <div class="history-header">
+      <div>
+        <p class="eyebrow">История</p>
+        <h2>Последние запросы</h2>
+      </div>
+      <button class="icon-button" id="closeHistory" type="button" title="Закрыть">
+        <span aria-hidden="true">x</span>
+      </button>
+    </div>
+    <button class="history-clear-button" id="clearHistory" type="button">
+      Очистить историю
+    </button>
+    <div class="history-list" id="historyList"></div>
+  </aside>
+
+  <main class="page-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">MTTEX technology</p>
+        <h1>Link finder</h1>
+      </div>
+      <button class="secondary-button" id="openHistory" type="button">
+        История
+      </button>
+    </header>
+
+    <section class="layout-grid">
+      <div class="main-column">
+        <section class="panel upload-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Пакетный поиск</p>
+              <h2>Загрузить файл</h2>
+            </div>
+            <span class="format-pill">CSV / XLSX</span>
+          </div>
+
+          <form class="drop-zone" id="uploadForm">
+            <input
+              class="file-input"
+              id="fileInput"
+              name="file"
+              type="file"
+              accept=".csv,.xlsx"
+            >
+            <label class="file-picker" for="fileInput">
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+              >
+                <path
+                  d="M12 15V4m0 0 4 4m-4-4L8 8M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                />
+              </svg>
+              <span>Выбрать файл</span>
+            </label>
+            <div class="selected-file">
+              <div class="file-card-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="24" height="24">
+                  <path
+                    d="M7 3h7l5 5v13H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                  />
+                  <path
+                    d="M14 3v5h5M9 13h6M9 17h6"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                  />
+                </svg>
+              </div>
+              <div class="file-details">
+                <strong id="fileTitle">Файл не выбран</strong>
+                <p id="fileHint">Поддерживаются только .csv и .xlsx</p>
+              </div>
+              <button
+                class="clear-file-button"
+                id="clearFileButton"
+                type="button"
+                title="Очистить файл"
+                hidden
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  width="18"
+                  height="18"
+                >
+                  <path
+                    d="M6 6l12 12M18 6 6 18"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-width="2"
+                  />
+                </svg>
+              </button>
+            </div>
+            <div class="upload-actions">
+              <button class="primary-button" type="submit">Запустить обработку</button>
+              <button
+                class="cancel-button"
+                id="cancelJobButton"
+                type="button"
+                hidden
+              >
+                Отменить
+              </button>
+            </div>
+          </form>
+
+          <div class="progress-box" id="progressBox" hidden>
+            <div class="progress-row">
+              <span id="progressLabel">Ожидание</span>
+              <span id="progressValue">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-meta">
+              <span id="progressCount">0/0</span>
+              <span id="progressLeft">осталось: 0</span>
+            </div>
+            <a class="download-link" id="downloadLink" href="#" hidden>
+              Скачать результат
+            </a>
+          </div>
+        </section>
+
+        <section class="panel search-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Одиночный поиск</p>
+              <h2>Получить ссылки по одному запросу (краткость лучший друг)</h2>
+            </div>
+          </div>
+
+          <form class="search-form" id="singleSearchForm">
+            <input
+              id="singleQuery"
+              name="query"
+              type="search"
+              placeholder="Например: лопата совковая"
+              maxlength="400"
+              autocomplete="off"
+            >
+            <button class="primary-button" type="submit">Искать</button>
+          </form>
+
+          <div class="result-list" id="singleResults"></div>
+        </section>
+      </div>
+
+      <aside class="side-column">
+        <section class="panel metric-panel">
+          <p class="eyebrow">Стоимость</p>
+          <div class="metric">
+            <span>Цена за 1 отложенный запрос</span>
+            <strong id="requestUnitPrice">0,0305 ₽</strong>
+          </div>
+          <div class="metric">
+            <span>Цена за 1000 отложенных запросов</span>
+            <strong id="requestPricePer1000">30,5 ₽</strong>
+          </div>
+          <div class="tariff-row" id="tariffRow">
+            <div class="tariff-pill active" id="dayTariff">
+              <span>День</span>
+              <strong>30,5 ₽</strong>
+            </div>
+            <div class="tariff-pill inactive" id="nightTariff">
+              <span>Ночь</span>
+              <strong>25,41 ₽</strong>
+            </div>
+          </div>
+          <div class="metric">
+            <span>Запросов в текущем списке</span>
+            <strong id="currentCount">0</strong>
+          </div>
+          <div class="metric">
+            <span>Оценка стоимости</span>
+            <strong id="currentCost">0 ₽</strong>
+          </div>
+          <div class="spend-summary">
+            <div class="spend-card spend-card-day">
+              <span>Днём за час</span>
+              <strong id="daySpendCount">0</strong>
+              <small>запросов</small>
+            </div>
+            <div class="spend-card spend-card-night">
+              <span>Ночью за час</span>
+              <strong id="nightSpendCount">0</strong>
+              <small>запросов</small>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel quota-panel">
+          <p class="eyebrow">Лимиты</p>
+          <div class="quota-ring" id="quotaRing">
+            <span id="quotaPercent">0%</span>
+          </div>
+          <div class="metric">
+            <span>Запросов за час</span>
+            <strong id="dailyCount">0</strong>
+          </div>
+          <div class="metric">
+            <span>Максимальный лимит</span>
+            <strong id="dailyLimit">35 000</strong>
+          </div>
+          <div class="quota-note" id="quotaNote">
+            В норме
+          </div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
