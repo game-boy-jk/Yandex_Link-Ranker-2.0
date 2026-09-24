@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import httpx
 from batch.table_files import BatchQuery
 from core import config
-from core.quotas import DEFERRED_REQUEST_SECOND_QUOTA
+from core.quotas import DEFERRED_REQUEST_SECOND_QUOTA, QuotaLimitError
 from ranking.link_ranker import find_product_links_strict
 from search.yandex_search import YandexSearchConfigError, YandexSearchResponseError
 
@@ -187,6 +187,7 @@ def process_query(
     except (
         YandexSearchConfigError,
         YandexSearchResponseError,
+        QuotaLimitError,
         httpx.HTTPError,
     ) as exc:
         return BatchResult(

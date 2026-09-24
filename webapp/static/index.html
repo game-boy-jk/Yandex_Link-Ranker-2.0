@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Link finder</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles-v2.css">
 </head>
 <body>
   <aside class="history-panel" id="historyPanel" aria-label="История запросов">
@@ -26,9 +26,13 @@
 
   <main class="page-shell">
     <header class="topbar">
-      <div>
-        <p class="eyebrow">MTTEX technology</p>
-        <h1>Link finder</h1>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">↗</span>
+        <div>
+          <p class="eyebrow">MTTEX technology</p>
+          <h1>Link finder</h1>
+          <p class="page-subtitle">Быстрый поиск подходящих товарных ссылок</p>
+        </div>
       </div>
       <button class="secondary-button" id="openHistory" type="button">
         История
@@ -37,11 +41,36 @@
 
     <section class="layout-grid">
       <div class="main-column">
+        <section class="panel search-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Один запрос → до 3 ссылок</p>
+              <h2>Найти ссылки на товар</h2>
+            </div>
+          </div>
+
+          <form class="search-form" id="singleSearchForm">
+            <input
+              id="singleQuery"
+              name="query"
+              type="search"
+              placeholder="Например: лопата совковая"
+              maxlength="400"
+              autocomplete="off"
+              aria-label="Название товара"
+            >
+            <button class="primary-button" type="submit">Найти</button>
+          </form>
+
+          <div class="result-list" id="singleResults" aria-live="polite"></div>
+        </section>
+
         <section class="panel upload-panel">
           <div class="panel-head">
             <div>
               <p class="eyebrow">Пакетный поиск</p>
-              <h2>Загрузить файл</h2>
+              <h2>Поиск по списку</h2>
+              <p class="section-subtitle">Загрузите CSV или XLSX с названиями товаров.</p>
             </div>
             <span class="format-pill">CSV / XLSX</span>
           </div>
@@ -148,29 +177,6 @@
               Скачать результат
             </a>
           </div>
-        </section>
-
-        <section class="panel search-panel">
-          <div class="panel-head">
-            <div>
-              <p class="eyebrow">Одиночный поиск</p>
-              <h2>Получить ссылки по одному запросу (краткость лучший друг)</h2>
-            </div>
-          </div>
-
-          <form class="search-form" id="singleSearchForm">
-            <input
-              id="singleQuery"
-              name="query"
-              type="search"
-              placeholder="Например: лопата совковая"
-              maxlength="400"
-              autocomplete="off"
-            >
-            <button class="primary-button" type="submit">Искать</button>
-          </form>
-
-          <div class="result-list" id="singleResults"></div>
         </section>
       </div>
 

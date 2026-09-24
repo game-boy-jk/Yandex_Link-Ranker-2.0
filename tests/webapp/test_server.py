@@ -7,31 +7,45 @@ from http import HTTPStatus
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from search.yandex_search import YandexSearchConfigError
 from webapp.jobs import HistoryStore, JobManager, SearchHistoryItem, ensure_web_dirs
 from webapp.metrics import DEFERRED_REQUEST_HOURLY_QUOTA
-from webapp.server import MAX_UPLOAD_BYTES, WebAppHandler
+from webapp.server import MAX_JSON_BYTES, MAX_UPLOAD_BYTES, WebAppHandler
 
 
 @contextmanager
 def run_test_server(manager: JobManager | None = None) -> Iterator[str]:
     """Запускает HTTP-сервер webapp на свободном локальном порту."""
 
-    ensure_web_dirs()
-    old_manager = WebAppHandler.manager
-    WebAppHandler.manager = manager or JobManager()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), WebAppHandler)
-    host, port = server.server_address
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    with TemporaryDirectory(prefix="scoring_server_test_") as directory:
+        test_dir = Path(directory)
+        test_manager = manager or JobManager()
+        if manager is None:
+            test_manager.history = HistoryStore(test_dir / "history.json")
 
-    try:
-        yield f"{host}:{port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-        WebAppHandler.manager = old_manager
+        with (
+            patch("webapp.server.UPLOAD_DIR", test_dir / "uploads"),
+            patch("webapp.jobs.WEB_RESULTS_DIR", test_dir / "results"),
+        ):
+            ensure_web_dirs()
+            (test_dir / "uploads").mkdir()
+            old_manager = WebAppHandler.manager
+            WebAppHandler.manager = test_manager
+            server = ThreadingHTTPServer(("127.0.0.1", 0), WebAppHandler)
+            host, port = server.server_address
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            try:
+                yield f"{host}:{port}"
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                WebAppHandler.manager = old_manager
 
 
 def test_estimate_counts_uploaded_csv_queries() -> None:
@@ -72,6 +86,63 @@ def test_metrics_rejects_invalid_count() -> None:
 
     assert status == HTTPStatus.BAD_REQUEST
     assert payload["error"] == "count должен быть целым числом"
+
+
+def test_single_search_returns_three_links_for_one_query(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Один HTTP-запрос возвращает три ссылки из выдачи Яндекса."""
+
+    query = "Лопата совковая"
+    search_calls: list[tuple[str, int]] = []
+
+    def fake_search_yandex(value: str, *, limit: int) -> list[dict[str, str]]:
+        search_calls.append((value, limit))
+        return [
+            {"url": f"https://shop-{index}.test/shovel", "title": query}
+            for index in range(4)
+        ]
+
+    monkeypatch.setattr("ranking.link_ranker.search_yandex", fake_search_yandex)
+    manager = make_manager_with_history(tmp_path)
+
+    with run_test_server(manager=manager) as address:
+        status, payload = post_json(
+            address=address,
+            path="/api/search",
+            body=json.dumps({"query": query}).encode("utf-8"),
+            content_type="application/json",
+        )
+
+    assert status == HTTPStatus.OK
+    assert search_calls == [(query, 30)]
+    assert payload["status"] == "found"
+    assert payload["urls"] == [
+        f"https://shop-{index}.test/shovel" for index in range(3)
+    ]
+    assert payload["usage"]["currentHour"] == 1
+
+
+def test_single_search_without_config_does_not_consume_quota(
+    monkeypatch, tmp_path: Path
+) -> None:
+    def missing_config(query: str) -> list[str]:
+        raise YandexSearchConfigError("ключ не задан")
+
+    monkeypatch.setattr("webapp.jobs.find_product_links_strict", missing_config)
+    manager = make_manager_with_history(tmp_path)
+
+    with run_test_server(manager=manager) as address:
+        status, payload = post_json(
+            address=address,
+            path="/api/search",
+            body=json.dumps({"query": "Лопата"}).encode("utf-8"),
+            content_type="application/json",
+        )
+
+    assert status == HTTPStatus.BAD_GATEWAY
+    assert "ключ не задан" in payload["error"]
+    assert manager.usage.get() == 0
 
 
 def test_history_delete_removes_single_item(tmp_path: Path) -> None:
@@ -203,13 +274,16 @@ def test_cancel_running_upload_job(monkeypatch) -> None:
     assert payload["job"]["status"] == "canceled"
 
 
-def test_canceled_upload_counts_completed_requests(monkeypatch) -> None:
+def test_canceled_upload_counts_completed_requests(monkeypatch, tmp_path: Path) -> None:
     body, content_type = make_multipart_file(
         filename="queries.csv",
         content="query\nЛопата\nКраска\n".encode("utf-8"),
     )
 
     def fake_process_queries(*args: object, **kwargs: object) -> list[object]:
+        search = kwargs["search"]
+        assert callable(search)
+        search("Лопата")
         should_stop = kwargs.get("should_stop")
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -219,8 +293,10 @@ def test_canceled_upload_counts_completed_requests(monkeypatch) -> None:
         return [object()]
 
     monkeypatch.setattr("webapp.jobs.process_queries", fake_process_queries)
+    monkeypatch.setattr("webapp.jobs.find_product_links_strict", lambda query: [])
+    manager = make_manager_with_history(tmp_path)
 
-    with run_test_server() as address:
+    with run_test_server(manager=manager) as address:
         status, payload = post_json(
             address=address,
             path="/api/upload",
@@ -228,11 +304,16 @@ def test_canceled_upload_counts_completed_requests(monkeypatch) -> None:
             content_type=content_type,
         )
         job_id = str(payload["job"]["id"])
+        upload_path = manager.get_job(job_id).input_path
         post_empty(address=address, path=f"/api/jobs/{job_id}/cancel")
 
         for _ in range(30):
             status, payload = get_json(address=address, path=f"/api/jobs/{job_id}")
-            if payload["job"]["status"] == "canceled":
+            if (
+                payload["job"]["status"] == "canceled"
+                and payload["usage"]["currentHour"] == 1
+                and not upload_path.exists()
+            ):
                 break
             time.sleep(0.02)
 
@@ -240,6 +321,73 @@ def test_canceled_upload_counts_completed_requests(monkeypatch) -> None:
     assert payload["job"]["status"] == "canceled"
     assert payload["job"]["done"] == 1
     assert payload["usage"]["currentHour"] == 1
+    assert not upload_path.exists()
+
+
+def test_completed_upload_removes_temporary_file(monkeypatch, tmp_path: Path) -> None:
+    body, content_type = make_multipart_file(
+        filename="queries.csv",
+        content="query\nЛопата\n".encode("utf-8"),
+    )
+    monkeypatch.setattr(
+        "webapp.jobs.find_product_links_strict",
+        lambda query: ["https://shop.test/shovel"],
+    )
+    manager = make_manager_with_history(tmp_path)
+
+    with run_test_server(manager=manager) as address:
+        status, payload = post_json(
+            address=address,
+            path="/api/upload",
+            body=body,
+            content_type=content_type,
+        )
+        job_id = str(payload["job"]["id"])
+        upload_path = manager.get_job(job_id).input_path
+
+        for _ in range(30):
+            _, job_payload = get_json(address=address, path=f"/api/jobs/{job_id}")
+            if job_payload["job"]["status"] == "done" and not upload_path.exists():
+                break
+            time.sleep(0.02)
+
+    assert status == HTTPStatus.CREATED
+    assert job_payload["job"]["status"] == "done"
+    assert not upload_path.exists()
+
+
+def test_upload_without_config_does_not_consume_quota(
+    monkeypatch, tmp_path: Path
+) -> None:
+    body, content_type = make_multipart_file(
+        filename="queries.csv",
+        content="query\nЛопата\nКраска\n".encode("utf-8"),
+    )
+
+    def missing_config(query: str) -> list[str]:
+        raise YandexSearchConfigError("ключ не задан")
+
+    monkeypatch.setattr("webapp.jobs.find_product_links_strict", missing_config)
+    manager = make_manager_with_history(tmp_path)
+
+    with run_test_server(manager=manager) as address:
+        status, payload = post_json(
+            address=address,
+            path="/api/upload",
+            body=body,
+            content_type=content_type,
+        )
+        job_id = str(payload["job"]["id"])
+
+        for _ in range(30):
+            _, job_payload = get_json(address=address, path=f"/api/jobs/{job_id}")
+            if job_payload["job"]["status"] == "done":
+                break
+            time.sleep(0.02)
+
+    assert status == HTTPStatus.CREATED
+    assert job_payload["job"]["status"] == "done"
+    assert manager.usage.get() == 0
 
 
 def test_upload_job_marks_unexpected_batch_error(monkeypatch) -> None:
@@ -289,6 +437,37 @@ def test_upload_rejects_too_large_body_before_reading_file() -> None:
 
     assert status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
     assert "Файл слишком большой" in payload["error"]
+
+
+def test_search_rejects_oversized_json_before_reading_body() -> None:
+    headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(MAX_JSON_BYTES + 1),
+    }
+
+    with run_test_server() as address:
+        status, payload = post_raw(
+            address=address,
+            path="/api/search",
+            body=b"",
+            headers=headers,
+        )
+
+    assert status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    assert "JSON слишком большой" in payload["error"]
+
+
+def test_search_rejects_non_utf8_json() -> None:
+    with run_test_server() as address:
+        status, payload = post_json(
+            address=address,
+            path="/api/search",
+            body=b"\xff",
+            content_type="application/json",
+        )
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert payload["error"] == "JSON должен быть в UTF-8"
 
 
 def make_queries_csv(count: int) -> bytes:

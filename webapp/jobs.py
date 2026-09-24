@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +11,9 @@ from uuid import uuid4
 from batch.search_runner import process_queries, result_to_csv_row
 from batch.table_files import BatchFileError, BatchQuery
 from batch.table_files import load_queries_from_file, write_results_csv
+from core.quotas import QuotaLimitError
 from ranking.link_ranker import find_product_links_strict
+from search.yandex_search import YandexSearchConfigError
 from webapp.metrics import CostEstimate, QuotaEstimate
 from webapp.metrics import DEFERRED_REQUEST_SECOND_QUOTA
 from webapp.metrics import estimate_deferred_cost, estimate_deferred_quota
@@ -24,6 +28,7 @@ SUPPORTED_UPLOAD_SUFFIXES = {".csv", ".xlsx"}
 MAX_HISTORY_ITEMS = 100
 WEB_DEFAULT_WORKERS = 4
 WEB_DEFAULT_WORKERS_ENV = "WEB_DEFAULT_WORKERS"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -40,6 +45,15 @@ class SearchHistoryItem:
     total: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class UsageReservation:
+    """Место под запросы, занятое в часовом лимите."""
+
+    hour: datetime
+    count: int
+    tariff_code: str
+
+
 @dataclass(slots=True)
 class SearchJob:
     """Состояние фоновой обработки файла."""
@@ -49,6 +63,7 @@ class SearchJob:
     filename: str
     total: int
     cost: CostEstimate
+    reservation: UsageReservation
     done: int = 0
     status: str = "queued"
     error: str = ""
@@ -98,13 +113,67 @@ class HourlyUsage:
         with self._lock:
             self._reset_if_needed()
             safe_value = max(value, 0)
-            self._count += safe_value
-            if tariff_code == "night":
-                self._night_requests += safe_value
-            else:
-                self._day_requests += safe_value
-
+            self._add_unlocked(safe_value, tariff_code)
             return self._count
+
+    def reserve(self, value: int, *, tariff_code: str) -> UsageReservation:
+        """Атомарно занимает место в лимите до запуска запросов."""
+
+        with self._lock:
+            self._reset_if_needed()
+            safe_value = max(value, 0)
+            quota = estimate_deferred_quota(
+                current_hour=self._count,
+                requested=safe_value,
+            )
+            if quota.over_limit:
+                raise QuotaExceededError(quota)
+
+            self._add_unlocked(safe_value, tariff_code)
+            return UsageReservation(self._hour, safe_value, tariff_code)
+
+    def claim(
+        self,
+        reservation: UsageReservation,
+        *,
+        tariff_code: str,
+    ) -> UsageReservation | None:
+        """Проверяет лимит заново, если задача перешла в следующий час."""
+
+        with self._lock:
+            self._reset_if_needed()
+            if self._hour == reservation.hour:
+                return None
+
+            quota = estimate_deferred_quota(current_hour=self._count, requested=1)
+            if quota.over_limit:
+                raise QuotaExceededError(quota)
+            self._add_unlocked(1, tariff_code)
+            return UsageReservation(self._hour, 1, tariff_code)
+
+    def release(self, reservation: UsageReservation, unused: int) -> None:
+        """Освобождает неиспользованную часть брони в исходном часе."""
+
+        with self._lock:
+            self._reset_if_needed()
+            if self._hour != reservation.hour:
+                return
+
+            count = min(max(unused, 0), reservation.count)
+            self._count -= count
+            if reservation.tariff_code == "night":
+                self._night_requests -= count
+            else:
+                self._day_requests -= count
+
+    def _add_unlocked(self, value: int, tariff_code: str) -> None:
+        """Обновляет счётчики при уже захваченном lock."""
+
+        self._count += value
+        if tariff_code == "night":
+            self._night_requests += value
+        else:
+            self._day_requests += value
 
     def get(self) -> int:
         """Возвращает количество запросов за текущий час."""
@@ -220,7 +289,7 @@ class HistoryStore:
         )
 
 
-class QuotaExceededError(ValueError):
+class QuotaExceededError(QuotaLimitError):
     """Ошибка превышения лимита отложенных запросов."""
 
     def __init__(self, quota: QuotaEstimate) -> None:
@@ -260,17 +329,17 @@ class JobManager:
         """Создаёт фоновую задачу для загруженного файла."""
 
         queries = load_queries_from_file(input_path)
-        quota = self.usage.estimate(len(queries))
-        if quota.over_limit:
-            raise QuotaExceededError(quota)
-
         cost = estimate_deferred_cost(len(queries))
+        reservation = self.usage.reserve(
+            len(queries), tariff_code=cost.tariff_code
+        )
         job = SearchJob(
             job_id=uuid4().hex,
             input_path=input_path,
             filename=filename,
             total=len(queries),
             cost=cost,
+            reservation=reservation,
         )
 
         with self._lock:
@@ -282,7 +351,14 @@ class JobManager:
             args=(job.job_id, queries),
             daemon=True,
         )
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                self._jobs.pop(job.job_id, None)
+                self._cancel_events.pop(job.job_id, None)
+            self.usage.release(reservation, reservation.count)
+            raise
         return job
 
     def get_job(self, job_id: str) -> SearchJob | None:
@@ -319,12 +395,14 @@ class JobManager:
     def search_once(self, query: str) -> list[str]:
         """Выполняет одиночный поиск и добавляет запись в историю."""
 
-        quota = self.usage.estimate(1)
-        if quota.over_limit:
-            raise QuotaExceededError(quota)
-
-        urls = find_product_links_strict(query)
-        self.usage.add(1, tariff_code=estimate_deferred_cost(1).tariff_code)
+        reservation = self.usage.reserve(
+            1, tariff_code=estimate_deferred_cost(1).tariff_code
+        )
+        try:
+            urls = find_product_links_strict(query)
+        except YandexSearchConfigError:
+            self.usage.release(reservation, 1)
+            raise
         self.history.add(
             SearchHistoryItem(
                 created_at=datetime.now().isoformat(timespec="seconds"),
@@ -340,6 +418,47 @@ class JobManager:
         job = self.get_job(job_id)
         if job is None:
             return
+
+        started_count = 0
+        started_lock = threading.Lock()
+
+        def search_reserved(query: str) -> list[str]:
+            """Расходует бронь перед обращением к поиску."""
+
+            nonlocal started_count
+            tariff_code = estimate_deferred_cost(1).tariff_code
+            new_hour_claim = self.usage.claim(
+                job.reservation, tariff_code=tariff_code
+            )
+            with started_lock:
+                started_count += 1
+            try:
+                return find_product_links_strict(query)
+            except YandexSearchConfigError:
+                if new_hour_claim is not None:
+                    self.usage.release(new_hour_claim, 1)
+                with started_lock:
+                    started_count -= 1
+                raise
+
+        try:
+            self._process_file_job(job, queries, search_reserved)
+        finally:
+            self.usage.release(job.reservation, job.total - started_count)
+            try:
+                job.input_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Не удалось удалить временный файл %s: %s", job.input_path, exc)
+
+    def _process_file_job(
+        self,
+        job: SearchJob,
+        queries: list[BatchQuery],
+        search: Callable[[str], list[str]],
+    ) -> None:
+        """Обрабатывает файл и обновляет состояние фоновой задачи."""
+
+        job_id = job.job_id
 
         cancel_event = self._get_cancel_event(job_id)
         if cancel_event is not None and cancel_event.is_set():
@@ -357,7 +476,7 @@ class JobManager:
             results = process_queries(
                 queries,
                 workers=get_web_default_workers(),
-                search=find_product_links_strict,
+                search=search,
                 progress=lambda done, total: self._update_job(
                     job_id,
                     done=done,
@@ -367,11 +486,6 @@ class JobManager:
             )
             if cancel_event is not None and cancel_event.is_set():
                 completed_count = len(results)
-                if completed_count:
-                    self.usage.add(
-                        completed_count,
-                        tariff_code=job.cost.tariff_code,
-                    )
                 self._update_job(
                     job_id,
                     done=completed_count,
@@ -407,7 +521,6 @@ class JobManager:
             )
             return
 
-        self.usage.add(len(queries), tariff_code=job.cost.tariff_code)
         self._update_job(
             job_id,
             done=len(queries),

@@ -416,7 +416,7 @@ function renderSingleResults(urls) {
 
   singleResults.innerHTML = urls
     .map((url) => (
-      `<div class="result-item"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a></div>`
+      `<div class="result-item result-link"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a></div>`
     ))
     .join("");
 }

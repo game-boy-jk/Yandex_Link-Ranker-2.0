@@ -25,6 +25,7 @@ HOST = "127.0.0.1"
 PORT = 8000
 MAX_UPLOAD_MEGABYTES = 20
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MEGABYTES * 1024 * 1024
+MAX_JSON_BYTES = 16 * 1024
 
 
 class UploadTooLargeError(ValueError):
@@ -148,6 +149,13 @@ class WebAppHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.TOO_MANY_REQUESTS,
             )
             return
+        except RuntimeError as exc:
+            upload_path.unlink(missing_ok=True)
+            self.send_json(
+                {"error": f"Не удалось запустить обработку: {exc}"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
 
         self.send_json({"job": job_to_dict(job)}, status=HTTPStatus.CREATED)
 
@@ -202,6 +210,12 @@ class WebAppHandler(BaseHTTPRequestHandler):
 
         try:
             data = self.read_json()
+        except UploadTooLargeError as exc:
+            self.send_json(
+                {"error": str(exc)},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -400,11 +414,17 @@ class WebAppHandler(BaseHTTPRequestHandler):
         """Читает JSON-тело запроса."""
 
         content_length = self.read_content_length()
+        if content_length > MAX_JSON_BYTES:
+            raise UploadTooLargeError(
+                f"JSON слишком большой. Максимум: {MAX_JSON_BYTES} байт."
+            )
         if content_length <= 0:
             return {}
 
         try:
             value = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON должен быть в UTF-8") from exc
         except json.JSONDecodeError as exc:
             raise ValueError("Некорректный JSON") from exc
 

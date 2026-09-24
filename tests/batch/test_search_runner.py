@@ -3,7 +3,7 @@ import pytest
 from batch.search_runner import BatchResult, limit_workers, process_queries
 from batch.search_runner import result_to_csv_row
 from batch.table_files import BatchQuery
-from core.quotas import DEFERRED_REQUEST_SECOND_QUOTA
+from core.quotas import DEFERRED_REQUEST_SECOND_QUOTA, QuotaLimitError
 from search.yandex_search import YandexSearchResponseError
 
 
@@ -120,6 +120,24 @@ def test_process_queries_keeps_row_error_without_stopping_batch():
             urls=("https://example.test/краска",),
         ),
     ]
+
+
+def test_process_queries_keeps_quota_error_in_one_row():
+    queries = [
+        BatchQuery(row_number=2, query="лопата"),
+        BatchQuery(row_number=3, query="краска"),
+    ]
+
+    def fake_search(query: str) -> list[str]:
+        if query == "лопата":
+            raise QuotaLimitError("часовой лимит исчерпан")
+        return ["https://shop.test/paint"]
+
+    results = process_queries(queries, search=fake_search)
+
+    assert results[0].status == "error"
+    assert results[0].error == "QuotaLimitError: часовой лимит исчерпан"
+    assert results[1].urls == ("https://shop.test/paint",)
 
 
 def test_process_queries_does_not_hide_unexpected_errors():
